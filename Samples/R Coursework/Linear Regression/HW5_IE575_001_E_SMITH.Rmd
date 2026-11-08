@@ -1,0 +1,122 @@
+---
+title: "IE 575 Assignment 5"
+author: "Eric Smith"
+date: "2025-06-10"
+output: 
+  word_document:
+    toc: false
+    fig_caption: true
+---
+
+## Load libraries and Anscombe data
+
+```{r}
+
+# Set working directory
+setwd("D:/GradSchool/IE575/Lesson5")
+
+if (!require(dplyr))    install.packages("dplyr")
+library(dplyr)
+library(ggplot2)
+
+
+dat <- datasets::anscombe
+datLong <- data.frame(
+  group  = rep(1:4, each = 11),
+  x = unlist(dat[,c(1:4)]),
+  y = unlist(dat[,c(5:8)])
+)
+rownames(datLong) <- NULL
+datLong
+
+# Check structure.
+str(datLong)
+
+# Check for missing values in the dataset
+missing_values <- colSums(is.na(datLong))
+
+missing_values
+```
+
+
+## Question 1
+
+*Calculate the mean, variance, correlation, and a linear regression for each data set (No data partition). Using base R or ggplot2, create a visual representation of this data. What does this visualization show?*
+
+```{r}
+# Calculate the mean, variance, correlation, and a linear regression for each data set.
+datLong %>%
+  group_by(group) %>%
+  summarise(
+    mean_x = mean(x),
+    mean_y = mean(y),
+    var_x = var(x),
+    var_y = var(y),
+    cor_xy = cor(x, y),
+    lm_eqn = paste0("y = ", round(coef(lm(y ~ x, data = .))[2], 2), "x + ", round(coef(lm(y ~ x, data = .))[1], 2))
+  )
+
+```
+
+**Observations:** Looking at the Anscombe groupings, we see that all data sets have the same mean, variance, and linear formula, and the correlations are nearly identical except for some minute precision. All have an x mean of 8, a y mean of around 7.5, an x variance of 11, a y variance of around 4.1, and a correlation of around 0.82. The linear regression equations are the same (y = 0.5x + 3), and we see only slight precision differences in the correlations between x and y. Let's visualize this data to see how the data sets differ.
+
+```{r}
+# Let's see the regressions
+ggplot(datLong, aes(x = x, y = y)) +
+  geom_point() +
+  geom_smooth(method = "lm", se = FALSE, color = "red") +
+  facet_wrap(~ group) +
+  labs(title = "Anscombe's Quartet", x = "x", y = "y")
+```
+
+The visual shows the relationship between x and y for each of the four datasets in Anscombe's Quartet. Each dataset has the same statistical properties (mean, variance, correlation), but the scatter plots reveal different distributions and relationships. The linear regression line indicates that while the datasets have similar correlations, their actual data points are distributed quite differently, highlighting the importance of visualizing data beyond just summary statistics.
+
+
+## Question 2: How do you evaluate and compare the developed linear regression models in Question 1? Are there any issues with the models you built?
+
+We can clearly see issues with the models we built. The first and third datasets have a linear relationship, while the second and fourth datasets do not. The second dataset shows a curved relationship, and the fourth dataset shows that all the points are on the same x value, which means that the linear regression model will not be able to fit the data properly. And even though the third dataset has a linear relationship, a large outlier has moved the regression line away from the majority of the data points.
+
+We can further look into the suitability of each set by evaluating the residuals of the models we built. We can do this by plotting the residuals versus the fitted values, normal Q-Q plots, scale-location plots, and Cook's distance plots. This will help us understand how well the models fit the data and if there are any issues with the models. We'll do examples of dataset 1 and dataset 4.
+
+```{r}
+# Show an example of further evalution of dateset 1.
+# Let's create a linear model for the first dataset.
+lm1 <- lm(y ~ x, data = datLong[datLong$group == 1, ])
+# Summary of the models
+summary(lm1)
+
+# Lets evaluate Residauls versus Fitted values, Normal Q-Q, Scale-Location, and Cook's distance.
+par(mfrow = c(2, 2))
+# Residuals vs Fitted
+plot(lm1, which = 1, main = "Residuals vs Fitted for Model 1")
+# Normal Q-Q
+plot(lm1, which = 2, main = "Normal Q-Q for Model 1")
+# Scale-Location
+plot(lm1, which = 3, main = "Scale-Location for Model 1")
+# Residuals vs Leverage
+plot(lm1, which = 4, main = "Cook's Distance for Model 1")
+
+
+```
+```{r}
+
+# And let's do the same for the fourth dataset.
+lm4 <- lm(y ~ x, data = datLong[datLong$group == 4, ])
+summary(lm4)
+# Let's evaluate Residauls versus Fitted values, Normal Q-Q, Scale-Location, and Cook's distance.
+par(mfrow = c(2, 2))
+# Residuals vs Fitted
+plot(lm4, which = 1, main = "Residuals vs Fitted for Model 4")
+# Normal Q-Q
+plot(lm4, which = 2, main = "Normal Q-Q for Model 4")
+# Scale-Location
+plot(lm4, which = 3, main = "Scale-Location for Model 4")
+# Residuals vs Leverage
+plot(lm4, which = 4, main = "Cook's Distance for Model 4")
+
+
+```
+
+**Observations:** Comparing Model 1 with Model 4, we see that Model 1 has a linear relationship with the data. All charting looks pretty good and evenly distributed for Model 1, while Model 4 does not. The residuals for Model 1 are randomly distributed, while the residuals for Model 4 are all in a straight vertical line. The scale-location plot for Model 1 shows that the residuals are distributed evenly, while the scale-location plot for Model 4 shows that the residuals are all along a straight vertical line and are not equally distributed along the predictor. 
+
+**Conclusion:** The Anscombe data sets show that even if the summary statistics are the same, the data can be very different. This is why it is important to visualize the data before building a model.

@@ -1,0 +1,487 @@
+---
+title: "IE 575 Homework 9"
+author: "Eric Smith"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+```{r load-libraries, echo=FALSE}
+library(dplyr)
+library(caret)
+library(pROC)
+library(ggplot2)
+library(readxl)
+library(tidyr)
+library(e1071)
+library(kableExtra)
+```
+
+## 1.1 Load and Inspect Data
+```{r, echo=FALSE}
+setwd("D:/GradSchool/IE575/Lesson11")
+data <- read_excel("default_of_credit_card_clients.xlsx")
+head(data)
+str(data)
+```
+
+## 1.2 Data Cleaning & Preparation
+```{r}
+# Extract proper column names from first row
+col_names <- as.character(data[1, -1])
+data_clean <- data[-1, -1]
+names(data_clean) <- col_names
+
+# Convert numeric columns
+data_clean <- data_clean %>% mutate(across(everything(), as.numeric))
+
+# Target variable as factor with readable labels
+data_clean$`default payment next month` <- factor(
+  data_clean$`default payment next month`,
+  levels = c(0,1),
+  labels = c("No Default","Default")
+)
+
+# Quick NA and duplicate check
+na_report <- colSums(is.na(data_clean))
+duplicates <- sum(duplicated(data_clean))
+cat("Rows with NAs:", sum(!complete.cases(data_clean)),"\nDuplicates:",duplicates)
+```
+
+```{r}
+# Clean version with factors for categorical fields
+new_names <- as.character(unlist(data[1, ]))
+credit_df <- data[-1, ]
+names(credit_df) <- new_names
+
+credit_df <- credit_df %>% mutate(
+  SEX = factor(SEX, levels=c("1","2"), labels=c("Male","Female")),
+  EDUCATION = factor(EDUCATION, levels=c("1","2","3","4"),
+                     labels=c("Graduate School","University","High School","Others")),
+  MARRIAGE = factor(MARRIAGE, levels=c("1","2","3"), labels=c("Married","Single","Others"))
+)
+
+num_cols <- setdiff(names(credit_df), c("SEX","EDUCATION","MARRIAGE","default payment next month"))
+credit_df <- credit_df %>%
+  mutate(
+    across(all_of(num_cols), as.numeric),
+    Y = factor(`default payment next month`,
+               levels = c(1,0),
+               labels = c("Default","No Default"))
+  ) %>%
+  select(-`default payment next month`)
+```
+
+> **Initial Data Inspection**
+>
+> As we saw from this same credit card data last time, there weren’t any missing values to worry about, and only 35 duplicate rows.
+> 
+> In this dataset, there were far more people who didn’t default compared to those who did as we see in Fig. 1 below. That’s important because a model could just predict “no default” for everyone and still look decent on paper, so exploring the model's nuances is key to determine variable relationships.This class imbalance means the model can achieve reasonable accuracy by favoring the majority class, so performance on defaulters needs closer attention.
+> 
+> I made sure the target variable (default vs. no default) was set up correctly as a factor and translated it back for our visuals and diagnostics (as was recommended in the last assignment), and I scaled the predictors so that big numbers like credit limits wouldn’t overshadow everything else.
+
+### Class Distribution
+```{r}
+ggplot(credit_df, aes(x=Y, fill=Y)) +
+  geom_bar() +
+  labs(title="Class Distribution: Default vs No Default", x="Class", y="Count") +
+  theme_minimal()
+```
+
+<center>*Fig. 1: Class Distribution of Default vs No Default*</center>
+
+## 1.3 Partition and Train NB Model
+```{r}
+set.seed(123)
+split_idx <- createDataPartition(credit_df$Y, p=0.8, list=FALSE)
+train_data <- credit_df[split_idx,]
+test_data <- credit_df[-split_idx,]
+
+train_X <- select(train_data, -Y)
+train_Y <- train_data$Y
+test_X <- select(test_data, -Y)
+test_Y <- test_data$Y
+
+nb_model <- naiveBayes(train_X, train_Y)
+```
+
+> **Training a Naïve Bayes Model**
+> 
+> Naïve Bayes is a good model to explore this data because it handles both categorical and numeric features efficiently and provides interpretable probabilities.
+> 
+> I split the data into 80% for training and 20% for testing, then built a simple Naïve Bayes model. Naive Bayes should be easy to interpret—it calculates the probability of someone defaulting based on their individual features (like payment history or demographics), assuming they’re independent.
+> 
+> Naive Bays a good starting point to see if there are any clear patterns, and can be a start for more complex models later. It’s not the most powerful model, but it’s fast and gives a good baseline for comparison.
+
+## 1.4 Diagnostics
+```{r}
+train_pred <- predict(nb_model, train_X)
+test_pred <- predict(nb_model, test_X)
+cm <- confusionMatrix(test_pred, test_Y)
+
+# Extract & unname values
+acc_val   <- unname(cm$overall["Accuracy"])
+sens_val  <- unname(cm$byClass["Sensitivity"])
+spec_val  <- unname(cm$byClass["Specificity"])
+kappa_val <- unname(cm$overall["Kappa"])
+
+# Build clean table
+metrics <- data.frame(
+  Metric = c("Accuracy", "Sensitivity (No Default)", "Specificity (Default)", "Kappa"),
+  Value  = round(c(acc_val, sens_val, spec_val, kappa_val), 4)
+)
+
+# Pretty table
+knitr::kable(metrics, caption = "Table 1: Naïve Bayes Model Performance on Test Set") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+
+```{r}
+test_prob <- predict(nb_model, test_X, type="raw")
+test_probs_df <- as.data.frame(test_prob)
+test_probs_df$true_class <- test_Y
+
+# ROC & AUC updated for relabeled classes
+roc_obj <- roc(
+  response = test_Y,
+  predictor = test_prob[,"Default"],
+  levels = c("No Default","Default")
+)
+roclabel = paste("ROC Curve for Naive Bayes with AUC of ",round(auc(roc_obj), 3))
+plot(roc_obj, main=roclabel)
+```
+
+<center>*Fig. 2: ROC Curve for Naïve Bayes Model*</center>
+
+```{r}
+# Retrain NB with Laplace smoothing for stable tables
+nb_model_laplace <- naiveBayes(train_X, train_Y, laplace = 1)
+
+# Identify categorical-like features with few unique values
+cat_features <- names(train_data)[sapply(train_data, function(x) length(unique(x)) < 20)]
+
+plot_data_list <- lapply(cat_features, function(feat) {
+  tbl <- nb_model_laplace$tables[[feat]]
+  
+  # If there's no table (numeric-only feature), skip it
+  if (is.null(tbl) || ncol(tbl) == 0) return(NULL)
+  
+  # Get the original column names (factor levels)
+  level_names <- colnames(tbl)
+  
+  # Convert table to data frame
+  df <- as.data.frame.matrix(tbl)
+  df$Class <- rownames(tbl)
+  
+  # Only rename if we have valid level names
+  if (length(level_names) > 0) {
+    colnames(df)[seq_along(level_names)] <- level_names
+  }
+  
+  # Pivot to long format
+  df_long <- pivot_longer(df, -Class, names_to = "Value", values_to = "Prob")
+  df_long$Feature <- feat
+  return(df_long)
+})
+
+# Combine all valid features
+plot_data <- bind_rows(plot_data_list)
+
+if (!is.null(plot_data) && nrow(plot_data) > 0) {
+  ggplot(plot_data, aes(x = Value, y = Class, fill = Prob)) +
+    geom_tile(color = "grey90") +
+    scale_fill_gradient(low = "white", high = "blue") +
+    facet_wrap(~Feature, scales = "free_x", ncol = 3) +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+    labs(
+      title = "Naive Bayes Conditional Probabilities",
+      x = "Feature Value",
+      y = "Class"
+    )
+}
+
+```
+
+<center>*Fig. 3: Naïve Bayes Conditional Probabilities Heatmap*</center>
+
+> **Visualizations**
+>
+> To better understand how the model was making decisions, I looked at two key visualizations.
+> 
+> ROC Curve: This showed that the model performs better than random guessing, with a nice curve above the baseline diagonal. It confirmed the model has some predictive power, but it’s not strong enough to fully rely on.
+> 
+> Naïve Bayes Conditional Probabilities Heatmap (Fig. 3): This heatmap shows how different features—like education level, marital status, sex, and past payment behavior (PAY_0 to PAY_6)—relate to the likelihood of default (class 1) versus no default (class 0). Darker blue areas represent higher probabilities. For the payment status features (PAY_0 to PAY_6), the model treats these as continuous variables, so the labels V1, V2, etc. are simply internal bins created by the model’s Gaussian density estimation (how the Naïve Bayes model handles continuous numeric features) rather than actual repayment states. Even without exact repayment labels shown, you can still see a clear pattern: worse repayment history corresponds to a higher likelihood of default, as highlighted by the darker blue shades for the “Default” class.
+> 
+> A couple of quick takeaways:
+> 
+> - Past payment status (like PAY_0, PAY_2, etc.) clearly had stronger influence, with darker shades showing higher probabilities of default for certain categories.
+> 
+> - Demographic features like education and marriage status had some variation, but not nearly as strong as payment history.
+> 
+> - Sex didn’t show much difference, as both male and female categories looked evenly distributed.
+> 
+> So overall, this visualization made it clear that recent payment behavior mattered more for predicting defaults than demographics, which matches what we’d expect intuitively.
+>
+> **Model Evaluation**
+> 
+> On the training data, the model achieved about 75% accuracy, and on the test data, it remained consistent at ~75.5%, which is expected when moving to unseen data.
+> 
+> Looking deeper:
+> 
+> - Sensitivity (catching actual defaulters) was about 57%
+> 
+> - Specificity (identifying non-defaulters) was stronger at 81%
+> 
+> - Kappa was 0.35, showing the model is better than random guessing but still limited.
+The AUC of 0.73 confirms it has some predictive power—good for basic risk segmentation but not strong enough for automatic approval/denial decisions
+> 
+> - ROC: The ROC curve sat nicely above the random diagonal line, which means the model has some predictive power. It’s not a rockstar, but it provides some great information on how different features relate to the likelihood of defaulting on a credit card payment.
+> 
+> What this means overall: This Naïve Bayes model has moderate predictive power but is far from perfect. It correctly classifies about 75% of cases, which is better than random guessing but still leaves room for error. The model is better at identifying non-defaulters than actual defaulters, which makes sense given the class imbalance. On the positive side, the AUC of 0.73 suggests the model can still rank a defaulter higher than a non-defaulter about 73% of the time—good enough for basic risk segmentation but not strong enough for high-stakes decisions like automatic approvals or denials.
+> 
+> In a credit risk scenario, false negatives (missing a true defaulter) are costlier than false positives (flagging a safe customer), so improving specificity would have higher business value.
+
+
+## 1.5 Bayes Formula Illustration
+```{r}
+illustration_features <- c("SEX","EDUCATION","MARRIAGE")
+classes <- levels(train_Y)
+
+safe_idx <- which.min(sapply(1:nrow(train_X), function(i){
+  any(sapply(illustration_features, function(f){
+    val <- as.character(train_X[[f]][i])
+    tbl <- nb_model_laplace$tables[[f]]
+    is.null(tbl) || !(val %in% colnames(tbl)) || any(tbl[,val]==0)
+  }))
+}))
+
+sample_row <- train_X[safe_idx,,drop=FALSE]
+sample_true <- train_Y[safe_idx]
+
+# Build likelihood_breakdown without duplicate rowname suffixes
+likelihood_breakdown <- do.call(rbind, lapply(illustration_features, function(f){
+  tbl <- nb_model_laplace$tables[[f]]
+  val <- as.character(sample_row[[f]])
+  df_tmp <- data.frame(
+    Feature = f,
+    Value = val,
+    Class = classes,
+    Likelihood = tbl[, val],
+    stringsAsFactors = FALSE
+  )
+  return(df_tmp)
+}))
+
+# Reset row names to avoid automatic numbering suffixes
+rownames(likelihood_breakdown) <- NULL
+
+likelihood_prod <- likelihood_breakdown %>%
+  group_by(Class) %>%
+  summarise(LikelihoodProduct = prod(Likelihood), .groups = "drop")
+
+priors <- nb_model_laplace$apriori / sum(nb_model_laplace$apriori)
+likelihood_prod$Prior <- priors[likelihood_prod$Class]
+likelihood_prod$Numerator <- likelihood_prod$Prior * likelihood_prod$LikelihoodProduct
+likelihood_prod$Posterior <- likelihood_prod$Numerator / sum(likelihood_prod$Numerator)
+
+cat("Bayes Illustration for Sample", safe_idx, "(True:", sample_true, ")\n")
+likelihood_breakdown
+likelihood_prod
+
+
+```
+
+```{r bayes-tables, results='asis', echo=FALSE}
+
+col_title <- "P(Feature∣Class)"
+i = 1
+for (cls in classes) {
+  prior_val <- likelihood_prod$Prior[likelihood_prod$Class == cls]
+  cls_rows <- likelihood_breakdown %>% filter(Class == cls)
+  likelihood_product <- prod(cls_rows$Likelihood)
+  posterior_num <- likelihood_prod$Numerator[likelihood_prod$Class == cls]
+  i = i+1
+
+  class_table <- cls_rows %>%
+    mutate(
+      Feature = as.character(Feature),
+      Value = as.character(Value),
+      !!col_title := sprintf("%.4f", Likelihood)
+    ) %>%
+    select(Feature, Value, !!col_title)
+
+  summary_rows <- tibble::tibble(
+    Feature = c("**Prior**", "**Product of Likelihoods**", "**Posterior Numerator**"),
+    Value   = c(sprintf("%.4f", prior_val),
+                sprintf("%.6f", likelihood_product),
+                sprintf("%.6f", posterior_num)),
+    !!col_title := c("", "", "")
+  )
+
+  display_table <- bind_rows(class_table, summary_rows)
+
+  print(
+    kable(
+      display_table,
+      align = "c",
+      caption = paste("Table ", i, ": Posterior Breakdown for Class:", cls),
+      escape = FALSE
+    ) %>%
+      kable_styling(
+        bootstrap_options = c("striped", "hover", "condensed"),
+        full_width = FALSE,
+        position = "center"
+      ) %>%
+      row_spec(
+        (nrow(display_table)-2):nrow(display_table),
+        bold = TRUE,
+        background = "#f7f7f7"
+      )
+  )
+}
+```
+
+```{r}
+
+
+# Visualize posterior
+ggplot(likelihood_prod, aes(x=Class, y=Posterior, fill=Class)) +
+  geom_col() +
+  theme_minimal() +
+  labs(title="Posterior for Sample", y="Posterior Probability")
+
+```
+
+<center>*Fig. 4: Posterior Probabilities for Sample*</center>
+
+> **Bayes’ Theorem Illustration**
+> 
+> To make Bayes’ Theorem more concrete, I walked through a single example using three simple features—Sex, Education level, and Marital status—for one individual in the dataset.
+> 
+> For this sample, the person was:
+> 
+> - Female
+> 
+> - University educated
+> 
+> - Married
+> 
+> The model calculated how likely each feature value was for both classes: 0 (no default) and 1 (default). For example:
+> 
+> - For Females, the chance of no default was about 0.616, while the chance of default was slightly lower at 0.559.
+> 
+> - For University education, the likelihood of no default was 0.463 vs. 0.501 for default.
+> 
+> - For Married individuals, the likelihood was 0.445 for no default vs. 0.481 for default.
+> 
+> When you multiply those likelihoods together for each class, you get the product of likelihoods:
+> 
+> - No default: 0.1269
+> 
+> - Default: 0.1349
+> 
+> Then you combine these with the prior probabilities (about 78% for no default and 22% for default) to get the posterior numerators:
+> 
+> - No default: 0.0988
+> 
+> - Default: 0.0298
+> 
+> Finally, you normalize these values so they sum to 1, giving the final posterior probabilities:
+> 
+> - No default: ~77%
+> 
+> - Default: ~23%
+> 
+> So even though some individual features leaned slightly toward default (like education and marriage status), the much stronger prior probability of no default (78%) still dominates. As a result, the model predicts this person is more likely not to default.
+> 
+> The bar chart above (Fig. 4) makes this easier to see. The bar for No Default is much higher, showing the model confidently predicts this individual will likely not default.
+> 
+> This small breakdown helps demystify what the model is doing—it’s basically multiplying small “clues” from each feature, weighting them by how common each class is overall, and then normalizing so the two probabilities add up to 1.
+
+## 1.6 Comparison to Logistic Regression
+
+```{r}
+
+## 1.6.3 Logistic Regression as a Tuned Alternative
+
+# ---- Step 1: Separate numeric & factor columns ----
+num_cols <- sapply(train_data, is.numeric)
+fac_cols <- !num_cols
+
+# ---- Step 2: Median imputation for numeric columns ----
+preproc <- preProcess(train_data[, num_cols], method = c("medianImpute"))
+train_num_imp <- predict(preproc, train_data[, num_cols])
+test_num_imp  <- predict(preproc, test_data[, num_cols])
+
+# ---- Step 3: Mode imputation for factor columns ----
+impute_mode <- function(x) {
+  mode_val <- names(which.max(table(x)))
+  x[is.na(x)] <- mode_val
+  return(x)
+}
+
+train_fac_imp <- as.data.frame(lapply(train_data[, fac_cols], impute_mode))
+test_fac_imp  <- as.data.frame(lapply(test_data[, fac_cols], impute_mode))
+
+# ---- Step 4: Combine numeric + factor columns ----
+train_data_imp <- cbind(train_num_imp, train_fac_imp)
+test_data_imp  <- cbind(test_num_imp,  test_fac_imp)
+
+# Double-check: No more NAs
+stopifnot(sum(is.na(train_data_imp)) == 0)
+stopifnot(sum(is.na(test_data_imp)) == 0)
+
+# ---- Step 5: Train Logistic Regression on SAME split ----
+set.seed(123)
+log_model <- train(
+  Y ~ ., 
+  data = train_data_imp,
+  method = "glm",
+  family = binomial(),
+  trControl = trainControl(method = "none")
+)
+
+# ---- Step 6: Predict & Evaluate ----
+log_pred <- predict(log_model, test_data_imp)
+cm_log <- confusionMatrix(log_pred, test_data_imp$Y)
+
+# ---- Step 7: Compare Naïve Bayes vs Logistic Regression ----
+comparison_metrics <- data.frame(
+  Model        = c("Naïve Bayes", "Logistic Regression"),
+  Accuracy     = round(c(cm$overall['Accuracy'], cm_log$overall['Accuracy']), 4),
+  Kappa        = round(c(cm$overall['Kappa'], cm_log$overall['Kappa']), 4),
+  Sensitivity  = round(c(cm$byClass['Sensitivity'], cm_log$byClass['Sensitivity']),4),
+  Specificity  = round(c(cm$byClass['Specificity'], cm_log$byClass['Specificity']),4)
+)
+
+knitr::kable(comparison_metrics, caption="Naïve Bayes vs Logistic Regression") %>%
+  kable_styling(bootstrap_options=c("striped","hover"), full_width=FALSE)
+
+
+```
+
+> **Tuning and why another model like Logistic Regression may be better**
+> 
+> Let's quickly compare the trained model to a trained Logistic Regression model with the same data. Looking at the scores, Naïve Bayes had 75.5% accuracy with a more balanced sensitivity (57%) and specificity (81%). Logistic Regression pushed overall accuracy higher to 81% and nearly perfect specificity (97%), but at the cost of sensitivity, which dropped sharply to 24%. In other words, Logistic Regression was much better at correctly identifying people who won’t default but much worse at catching those who actually do. This trade-off highlights how a model can look “better” on accuracy alone while still failing to detect the riskier cases.
+> 
+> For this dataset, there isn’t much you can “tune” in a basic Naïve Bayes model. It makes its predictions by multiplying feature probabilities under a strong assumption that all features are independent. While you can add Laplace smoothing (to avoid zero probabilities), it doesn’t fundamentally change the way the model behaves. So its accuracy is mostly limited by that independence assumption.
+> 
+> Logistic Regression, on the other hand, doesn’t assume features are independent. It directly learns how much each feature (like past payment history or credit limit) pushes someone toward default or no default. Because the dataset has far more people who didn’t default, Logistic Regression leaned heavily toward predicting “No Default,” which raised overall accuracy. It basically got better at identifying the safe customers—hence its higher accuracy and very high specificity (correctly spotting non-defaulters).
+> 
+> The trade-off is that it missed more actual defaulters (lower sensitivity), which is a common issue when the classes are imbalanced. In plain terms: Logistic Regression became a better “safe customer detector,” while Naïve Bayes stayed more balanced but less accurate overall.
+
+
+## 1.7 Conclusion
+> 
+> Overall, this Naïve Bayes model turned out to be a simple yet interpretable tool for understanding credit card default risk. It correctly classified about 75% of cases and achieved an AUC of ~0.73, meaning it performs noticeably better than random guessing but still leaves room for improvement. The model does a better job identifying safe customers (specificity ~81%) than it does detecting true defaulters (sensitivity ~57%), which is a common limitation when the dataset is imbalanced toward non-defaulters.
+> 
+> From a business standpoint, this kind of model can be useful as a supporting tool for basic risk segmentation—helping flag higher-risk customers, prioritize outreach, or guide credit limit reviews. However, it’s not reliable enough for high-stakes decisions like fully automated approvals or denials, because it still misses a meaningful share of actual defaulters.
+> 
+> If I were taking this further, I’d try adding more behavioral features (influential data variables that may be untapped), and tuning the probability threshold depending on how cautious the business wants to be. Pairing it with more advanced models (like Logistic Regressions) would likely improve performance or even be a better alterntaive.
+> 
+> In the end, this exercise highlights how even a straightforward probabilistic model like Naïve Bayes can uncover meaningful patterns in customer risk while remaining transparent and easy to explain—though more sophisticated approaches would be needed for production-level credit risk decision-making.

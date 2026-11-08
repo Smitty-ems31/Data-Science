@@ -1,0 +1,615 @@
+---
+title: "IE 575 Homework 10"
+author: "Eric Smith"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,  # suppress warnings
+  message = FALSE   # (optional) suppress package messages
+)
+```
+
+```{r pressure, echo=FALSE}
+# Load necessary libraries
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tibble)
+  library(caret)
+  library(pROC)
+  library(ggplot2)
+  library(readxl)
+  library(tidyr)
+  library(tseries)
+  library(forecast)
+  library(patchwork)  # to combine two plots easily
+  library(knitr)      # for kable function
+})
+```
+
+## 1.1 Load and Explore Bike Demand Data
+
+```{r}
+# Load utility moving average function for later
+movavg <- function(x, n, m, type=c("s", "t", "w", "m", "e", "r")) {
+  stopifnot(is.numeric(x), is.numeric(n), is.character(type))
+  if (length(n) != 1 || ceiling(n != floor(n)) || n <= 1)
+    stop("Window length 'n' must be a single integer greater 1.")
+  nx <- length(x)
+  if (n >= nx)
+    stop("Window length 'n' must be greater then length of time series.")
+  y <- numeric(nx)
+  if (type == "s") {         # simple
+    for (k in 1:(n-1))  y[k] <- mean(x[1:k])
+    for (k in n:nx)     y[k] <- mean(x[(k-n+1):k])
+    for (k in (nx+1):(nx+m)) {
+      y[k] <- mean(x[(k-n):(k-1)]) 
+      x[k] <- y[k]
+    }
+  } else if (type == "t") {  # triangular
+    n <- ceiling((n + 1)/2)
+    s <- movavg(x, n, "s")
+    y <- movavg(s, n, "s")
+  } else if (type == "w") {  # weighted
+    for (k in 1:(n-1))  y[k] <- 2 * sum((k:1)*x[k:1]) / (k*(k+1))
+    for (k in n:nx)     y[k] <- 2 * sum((n:1)*x[k:(k-n+1)]) / (n*(n+1))
+  } else if (type == "m") {  # modified
+    y[1] <- x[1]
+    for (k in 2:nx)     y[k] <- y[k-1] + (x[k] - y[k-1])/n
+  } else if (type == "e") {  # exponential
+    a <- 2/(n+1)
+    y[1] <- x[1]
+    for (k in 2:nx)     y[k] <- a*x[k] + (1-a)*y[k-1]
+    for (k in (nx+1):(nx+m)) {
+      x[k] <- 0
+      y[k] <- a*x[k] + (1-a)*y[k-1]
+    }
+  } else if (type == "r") {  # running
+    a <- 1/n
+    y[1] <- x[1]
+    for (k in 2:nx)     y[k] <- a*x[k] + (1-a)*y[k-1]
+  } else
+    stop("The type must be one of 's', 't', 'w', 'm', 'e', or 'r'.")
+  return(y)
+}
+
+
+```
+
+```{r}
+# ==== 1. Load and Inspect Data ====
+
+setwd("D:/GradSchool/IE575/Lesson12")
+data <- read.csv("CitiBike_Oct2016_BikeDemand.csv")
+
+head(data)
+str(data)
+
+data$time <- as.POSIXct(data$time, format="%Y-%m-%d %H:%M:%S")
+data$date_only <- as.Date(data$time)
+data$hour_only <- format(data$time, "%H")
+
+unique_days <- unique(data$date_only)
+num_days <- length(unique_days)
+cat("Number of unique days in dataset:", num_days, "\n")
+print(unique_days)
+
+records_per_day <- table(data$date_only)
+print(records_per_day)
+```
+
+```{r daily_demand_distribution}
+daily_station1 <- tapply(data$X72, data$date_only, sum)
+daily_station2 <- tapply(data$X79, data$date_only, sum)
+
+par(mfrow=c(1,2))
+hist(daily_station1, main="Daily Demand - Station X72", xlab="Total Bikes per Day", col="skyblue")
+hist(daily_station2, main="Daily Demand - Station X79", xlab="Total Bikes per Day", col="lightgreen")
+```
+
+<center>*Fig. 1: Daily Demand Distribution for Stations X72 and X79*</center>
+
+**Observations:**
+- Station X72 shows a moderate spread of daily demand, with most days clustered around a central range but a few higher peaks indicating occasional spikes.
+- Station X79 appears to have slightly lower overall daily demand, with a tighter distribution and fewer high-demand outliers.
+- This suggests that Station X72 might serve a busier area with more variability in usage patterns, while Station X79 is more stable.
+
+```{r hourly_demand_distribution}
+hourly_means_s1 <- tapply(data$X72, data$hour_only, mean)
+hourly_means_s2 <- tapply(data$X79, data$hour_only, mean)
+
+par(mfrow=c(1,2))
+plot(as.numeric(names(hourly_means_s1)), hourly_means_s1, type="o",
+     main="Avg Hourly Demand - Station X72", xlab="Hour of Day", ylab="Avg Bikes")
+plot(as.numeric(names(hourly_means_s2)), hourly_means_s2, type="o",
+     main="Avg Hourly Demand - Station X79", xlab="Hour of Day", ylab="Avg Bikes")
+```
+
+<center>*Fig. 2: Average Hourly Demand for Stations X72 and X79*</center>
+
+**Observations:**
+- Both stations exhibit clear hourly patterns with demand peaking during morning and late-afternoon commute hours.
+- Station X72 shows more pronounced peak hours, suggesting it may serve more commuters.
+- Station X79’s hourly pattern is flatter but still reflects typical urban usage with slightly elevated midday demand.
+
+## 1.2 Create Moving Average Models for Bike Demand
+
+```{r}
+station1 <- data$X72
+station2 <- data$X79
+station1_ts <- ts(station1, frequency = 24)
+station2_ts <- ts(station2, frequency = 24)
+```
+
+```{r}
+par(mfrow=c(2,1))
+plot(time(station1_ts)/24, station1_ts, type="l",
+     main="Bike Demand at Station X72",
+     xlab="Day (1–21)", ylab="Hourly Demand")
+plot(time(station2_ts)/24, station2_ts, type="l",
+     main="Bike Demand at Station X79",
+     xlab="Day (1–21)", ylab="Hourly Demand")
+```
+
+<center>*Fig. 3: Hourly Bike Demand Time Series for Stations X72 and X79*</center>
+
+**Observations:**
+- Both stations show cyclical daily patterns, with visible regular rises and falls matching typical commuting cycles.
+- Station X72 seems to have higher fluctuations, indicating more variability in hourly demand.
+- Station X79 has a steadier pattern.
+
+```{r}
+adf.test(station1_ts)
+adf.test(station2_ts)
+```
+
+**Observations:**
+The Augmented Dickey-Fuller (ADF) test was conducted on the time series data for Station X79. The resulting p-value was 0.01, which is well below the 0.05 significance threshold. This indicates that we can reject the null hypothesis and that the statistical properties such as mean and variance appear stable over time, making it suitable for modeling.
+
+```{r}
+decomp1 <- stl(station1_ts, s.window="periodic")
+decomp2 <- stl(station2_ts, s.window="periodic")
+
+plot(decomp1)
+mtext("Decomposition – Station X72", side=3, line=3, cex=1.2, font=2)
+
+plot(decomp2)
+mtext("Decomposition - Station X79", side=3, line=3, cex=1.1, font=2)
+```
+
+<center>*Fig. 4: Seasonal Decomposition of Time Series for Stations X72 and X79*</center>
+
+**Observations:**
+- Decomposition reveals strong seasonality for both stations, matching the 24-hour cycle.
+- The trend component for Station X72 shows more distinct peaks and troughs, whereas Station X79 has a smoother trend.
+
+```{r}
+par(mfrow=c(2,2))
+acf(station1_ts, main="ACF - Station X72 (lags in hours)")
+pacf(station1_ts, main="PACF - Station X72 (lags in hours)")
+acf(station2_ts, main="ACF - Station X79 (lags in hours)")
+pacf(station2_ts, main="PACF - Station X79 (lags in hours)")
+```
+
+<center>*Fig. 5: ACF and PACF Plots for Stations X72 and X79*</center>
+ 
+
+```{r}
+diff_station1 <- diff(station1_ts)
+diff_station2 <- diff(station2_ts)
+
+adf.test(diff_station1)
+adf.test(diff_station2)
+
+par(mfrow=c(2,2))
+acf(diff_station1, main="ACF - Differenced Station X72 (lags in hours)")
+pacf(diff_station1, main="PACF - Differenced Station X72 (lags in hours)")
+acf(diff_station2, main="ACF - Differenced Station X79 (lags in hours)")
+pacf(diff_station2, main="PACF - Differenced Station X79 (lags in hours)")
+```
+
+<center>*Fig. 6: ACF and PACF Plots After Differencing*</center>
+ 
+  
+
+**Observations:**
+Both Station X72 and Station X79 passed the Augmented Dickey-Fuller (ADF) test, with p-values below 0.01. This confirms that the data has a stable variance after using differencing techniques. Differencing simply means we looked at the change in demand from one hour to the next, rather than the original demand levels themselves.
+
+Why do this? In many real-world datasets like bike rentals, the raw numbers can drift over time—maybe demand increases during weekdays and drops on weekends. This kind of trend makes the data non-stationary, meaning its behavior isn't consistent over time. Most time series models (like ARIMA, which we’ll use in the next lesson) require the data to be stationary—that is, stable in its average behavior and variance.
+
+By calculating the difference between each hour and the one before it, we removed this drifting pattern and turned the data into something more stable. Then we used the Augmented Dickey-Fuller (ADF) test, which confirmed the differenced data is now stationary (with p-values below 0.01).
+
+Finally, we plotted autocorrelation (ACF) and partial autocorrelation (PACF) for the differenced data. These plots help us see how much influence past hours have on the current hour. For example, if demand now mostly depends on demand in just the last hour or two, the PACF will drop off quickly. That’s exactly what we saw—especially for Station X72—indicating that only recent history matters, and complex patterns aren't needed for short-term forecasting.
+
+> **Decomposition Observations:**
+> 
+> The seasonal decomposition highlights a strong daily seasonality for both stations, which aligns with a 24-hour cycle typical of commuter or shared-bike usage. For Station X72, the trend component shows sharper peaks and troughs, likely reflecting bursts of demand (like rush hours). In contrast, Station X79’s trend appears smoother, suggesting more evenly distributed demand.
+> 
+> Both stations have a similar seasonal pattern—higher usage during daytime and reduced usage overnight—confirming that the model needs to account for seasonality when making predictions.
+> 
+> **ACF/PACF Observations:**
+> 
+> When examining the raw time series for both Station X72 and Station X79, the ACF plots show slowly decaying autocorrelations, which is a clear sign of non-stationarity. In simpler terms, the series has persistent patterns over time, meaning its mean and variance shift rather than staying stable.
+> 
+> The PACF plots for the undifferenced data show a few significant short-term lags before tapering off. This suggests that while there is some immediate dependency (like demand in the current hour depending on the last one or two hours), the long-term structure is more complex and requires differencing.
+> 
+> After applying first differencing, the Augmented Dickey-Fuller test confirmed stationarity for both series. For Station X72, the test statistic was -11.984 with a p-value of 0.01, while for Station X79 it was -10.5 with a p-value of 0.01. These strongly negative values mean the hypothesis of a unit root (non-stationarity) was rejected—so the differenced data is now stable enough for time series modeling.
+> 
+> Post-differencing, the ACF of Station X72 shows a sharp cutoff after lag 1, while the PACF shows minor spikes at lag 1 and 2. For Station X79, the pattern is similar but slightly smoother, suggesting less noisy hour-to-hour variation.
+>
+
+## 1.3 Predict the Next Three Hours
+
+```{r}
+m <- 3  # forecast horizon
+k <- 5  # smoothing window for exponential smoothing
+
+fc_s1_all <- movavg(station1, n = k, m = m, type = "e")
+fc_s2_all <- movavg(station2, n = k, m = m, type = "e")
+
+# Extract only the 3 forecast values (they are at the end)
+fc_s1_forecast <- tail(fc_s1_all, m)
+fc_s2_forecast <- tail(fc_s2_all, m)
+
+# Store like moving average object for reuse
+fc_s1 <- list(mean = fc_s1_forecast)
+fc_s2 <- list(mean = fc_s2_forecast)
+
+# Estimate recent standard deviation from last 24 hours
+sd_s1 <- sd(tail(station1, 24))
+sd_s2 <- sd(tail(station2, 24))
+
+# Construct intervals
+fc_s1$lower <- matrix(fc_s1$mean - 1.96 * sd_s1, ncol = 1)
+fc_s1$upper <- matrix(fc_s1$mean + 1.96 * sd_s1, ncol = 1)
+
+fc_s2$lower <- matrix(fc_s2$mean - 1.96 * sd_s2, ncol = 1)
+fc_s2$upper <- matrix(fc_s2$mean + 1.96 * sd_s2, ncol = 1)
+
+
+hour_forecast_df <- data.frame(
+  Hour_Ahead        = 1:3,
+  Station_X72_Pred  = round(fc_s1$mean, 2),
+  Station_X72_Lower = round(fc_s1$lower[,1], 2),
+  Station_X72_Upper = round(fc_s1$upper[,1], 2),
+  Station_X79_Pred  = round(fc_s2$mean, 2),
+  Station_X79_Lower = round(fc_s2$lower[,1], 2),
+  Station_X79_Upper = round(fc_s2$upper[,1], 2)
+)
+
+kable(hour_forecast_df, caption = "Table 1. Next 3-Hour Forecasts Using Exponential Smoothing with 95% Confidence Intervals")
+
+
+```
+
+**Observations:**
+- The forecast table shows realistic short-term predictions for the next 3 hours.
+- Station X72 has slightly higher predicted demand than Station X79, consistent with historical trends.
+- Confidence intervals widen slightly with each step ahead, indicating increasing uncertainty over time.
+
+```{r}
+history_window <- 24  
+hist_s1 <- tail(station1_ts, history_window)
+hist_s2 <- tail(station2_ts, history_window)
+
+# Combine history and forecast
+combined_s1 <- c(hist_s1, fc_s1$mean)
+combined_s2 <- c(hist_s2, fc_s2$mean)
+
+# Forecast indices
+forecast_indices <- (history_window + 1):(history_window + 3)
+
+# Confidence intervals
+ci_s1_lower <- fc_s1$lower[,1]
+ci_s1_upper <- fc_s1$upper[,1]
+ci_s2_lower <- fc_s2$lower[,1]
+ci_s2_upper <- fc_s2$upper[,1]
+
+par(mfrow=c(2,1), mar=c(4,4,4,2))
+
+# --- Station X72 ---
+plot(1:(history_window + 3),
+     combined_s1, type="l", col="black",
+     xlab="Hours (Last 24 + Forecast)", ylab="Bikes/hour",
+     main="3-Hour Forecast - Station X72")
+abline(v=history_window, col="red", lty=2)
+lines(forecast_indices, fc_s1$mean, col="blue", lwd=2)
+polygon(c(forecast_indices, rev(forecast_indices)),
+        c(ci_s1_lower, rev(ci_s1_upper)),
+        col=rgb(0,0,1,0.2), border=NA)
+legend("topleft",
+       legend=c("History","Forecast Mean","95% CI"),
+       col=c("black","blue",rgb(0,0,1,0.2)),
+       lty=c(1,1,NA),
+       pch=c(NA,NA,15),
+       bty="n")
+
+# --- Station X79 ---
+plot(1:(history_window + 3),
+     combined_s2, type="l", col="black",
+     xlab="Hours (Last 24 + Forecast)", ylab="Bikes/hour",
+     main="3-Hour Forecast - Station X79")
+abline(v=history_window, col="red", lty=2)
+lines(forecast_indices, fc_s2$mean, col="blue", lwd=2)
+polygon(c(forecast_indices, rev(forecast_indices)),
+        c(ci_s2_lower, rev(ci_s2_upper)),
+        col=rgb(0,0,1,0.2), border=NA)
+legend("topleft",
+       legend=c("History","Forecast Mean","95% CI"),
+       col=c("black","blue",rgb(0,0,1,0.2)),
+       lty=c(1,1,NA),
+       pch=c(NA,NA,15),
+       bty="n")
+
+```
+
+<center>*Fig. 7: 3-Hour Forecasts for Stations X72 and X79*</center>
+ 
+  
+  
+
+**Discussion for Question 1:**
+- The moving average captures the recent hourly trend effectively, producing forecasts consistent with observed usage cycles.
+- Station X72 is predicted to remain slightly busier in the next 3 hours, while Station X79 is more stable.
+- The forecast and confidence intervals provide actionable insights for short-term bike redistribution planning.
+
+> **Forecast Results for 3-Hour Demand:**
+>
+> The short-term forecast for the next three hours shows low but consistent demand at both stations, with Station X72 slightly exceeding Station X79 at each time point. For example, Station X72’s forecast declines modestly from 1.07 bikes/hour in hour 1 to 0.47 bikes/hour by hour 3. Station X79 follows a similar trend, dropping from 0.69 to 0.31 bikes/hour over the same period.
+> 
+> The 95% confidence intervals reflect high uncertainty, ranging widely from negative to positive values. For instance, in hour 1, Station X72’s interval spans from -4.39 to 6.52, while Station X79 ranges from -5.01 to 6.39. These wide intervals are expected for exponential smoothing models using recent data only, especially when the demand is low and noisy.
+> 
+> While the predictions themselves are modest, the consistent pattern—where Station X72 maintains slightly higher predicted demand—aligns with earlier findings from the hourly and daily demand visualizations. The wide intervals suggest caution should be taken when interpreting specific values, but the overall trend supports the notion that Station X72 serves a busier area during peak windows.
+
+
+
+
+## 2.1 Aggregate to Predict Daily Demand
+
+
+
+
+```{r}
+
+m <- 3  # forecast horizon
+
+## Station X72 forecasts
+ma_s1_k5  <- movavg(daily_station1, n=5,  m=m, type="s")
+ma_s1_k10 <- movavg(daily_station1, n=10, m=m, type="s")
+ma_s1_k15 <- movavg(daily_station1, n=15, m=m, type="s")
+
+## Station X79 forecasts
+ma_s2_k5  <- movavg(daily_station2, n=5,  m=m, type="s")
+ma_s2_k10 <- movavg(daily_station2, n=10, m=m, type="s")
+ma_s2_k15 <- movavg(daily_station2, n=15, m=m, type="s")
+
+# Extract only the last 3 forecasted values
+pred_s1_k5  <- tail(ma_s1_k5,  m)
+pred_s1_k10 <- tail(ma_s1_k10, m)
+pred_s1_k15 <- tail(ma_s1_k15, m)
+
+pred_s2_k5  <- tail(ma_s2_k5,  m)
+pred_s2_k10 <- tail(ma_s2_k10, m)
+pred_s2_k15 <- tail(ma_s2_k15, m)
+
+
+```
+
+
+```{r}
+forecast_df <- data.frame(
+  Day_Ahead = 1:m,
+  Station_X72_k5  = pred_s1_k5,
+  Station_X72_k10 = pred_s1_k10,
+  Station_X72_k15 = pred_s1_k15,
+  Station_X79_k5  = pred_s2_k5,
+  Station_X79_k10 = pred_s2_k10,
+  Station_X79_k15 = pred_s2_k15
+)
+
+kable(
+  forecast_df,
+  caption = "Table 2. Next 3-Day Forecasts for Stations X72 and X79 with Different k Values",
+  digits = 2,
+  align = "c"
+)
+```
+
+**Observations:**
+- The moving average forecasts populate correctly, showing three future days for each smoothing window.
+- Station X72 tends to have higher absolute forecast values than Station X79.
+- For both stations, the k=5 column is closest to recent demand; k=15 is more smoothed and lower.
+
+```{r}
+
+
+# Build data frame for both stations
+days <- 1:(length(daily_station1) + 3)
+
+df_plot <- data.frame(
+  Day = days,
+  X72_Actual = c(daily_station1, rep(NA, 3)),
+  X79_Actual = c(daily_station2, rep(NA, 3)),
+  X72_k5  = c(rep(NA, length(daily_station1)), pred_s1_k5),
+  X72_k10 = c(rep(NA, length(daily_station1)), pred_s1_k10),
+  X72_k15 = c(rep(NA, length(daily_station1)), pred_s1_k15),
+  X79_k5  = c(rep(NA, length(daily_station2)), pred_s2_k5),
+  X79_k10 = c(rep(NA, length(daily_station2)), pred_s2_k10),
+  X79_k15 = c(rep(NA, length(daily_station2)), pred_s2_k15)
+)
+
+# --- Station X72 tidy ---
+df_x72 <- df_plot %>%
+  select(Day, X72_Actual, X72_k5, X72_k10, X72_k15) %>%
+  pivot_longer(-Day, names_to="Series", values_to="Demand") %>%
+  mutate(Series = recode(Series,
+                         "X72_Actual" = "Actual",
+                         "X72_k5" = "Forecast k=5",
+                         "X72_k10" = "Forecast k=10",
+                         "X72_k15" = "Forecast k=15"))
+
+# --- Station X79 tidy ---
+df_x79 <- df_plot %>%
+  select(Day, X79_Actual, X79_k5, X79_k10, X79_k15) %>%
+  pivot_longer(-Day, names_to="Series", values_to="Demand") %>%
+  mutate(Series = recode(Series,
+                         "X79_Actual" = "Actual",
+                         "X79_k5" = "Forecast k=5",
+                         "X79_k10" = "Forecast k=10",
+                         "X79_k15" = "Forecast k=15"))
+
+# Plot for Station X72
+plot_x72 <- ggplot(df_x72, aes(x=Day, y=Demand, color=Series)) +
+  geom_line(size=1) +
+  geom_point(size=1.5) +
+  geom_smooth(se=FALSE, span=0.3, linetype="dashed") +
+  labs(
+    title="Daily Demand and Forecasts - Station X72",
+    x="Day", y="Bike Demand"
+  ) +
+  theme_minimal() +
+  theme(legend.position="bottom")
+
+# Plot for Station X79
+plot_x79 <- ggplot(df_x79, aes(x=Day, y=Demand, color=Series)) +
+  geom_line(size=1) +
+  geom_point(size=1.5) +
+  geom_smooth(se=FALSE, span=0.3, linetype="dashed") +
+  labs(
+    title="Daily Demand and Forecasts - Station X79",
+    x="Day", y="Bike Demand"
+  ) +
+  theme_minimal() +
+  theme(legend.position="bottom")
+
+# Combine the two plots vertically
+combined_plot <- plot_x72 / plot_x79
+combined_plot
+```
+ 
+<center>*Fig. 8: Daily Demand and Forecasts for Stations X72 and X79*</center>
+ 
+  
+
+**Observations:**
+- Visuals confirm that k=5 forecasts align more closely with the last observed day, while k=15 forecasts are smoother and dampen spikes.
+- Station X72 again shows larger day-to-day swings, which k=15 flattens noticeably.
+- Station X79 stays steadier, making k-values much closer to one another.
+
+```{r}
+# Last 5-day window weighting illustration
+last_window_s1_k5 <- tail(daily_station1, 5)
+last_window_s2_k5 <- tail(daily_station2, 5)
+k5_pred_s1 <- mean(last_window_s1_k5)
+k5_pred_s2 <- mean(last_window_s2_k5)
+illustration_df <- data.frame(
+  Day = paste0("Day-", seq_len(5)),
+  Demand_X72 = last_window_s1_k5,
+  Weight_X72 = rep(1/5, 5),
+  Contribution_X72 = last_window_s1_k5 * (1/5),
+  Demand_X79 = last_window_s2_k5,
+  Weight_X79 = rep(1/5, 5),
+  Contribution_X79 = last_window_s2_k5 * (1/5)
+)
+knitr::kable(illustration_df, caption = "Table 3. Illustration of Moving Average Weighting (k=5) for Last 5 Days")
+```
+
+**Observations:**
+- The k=5 moving average applies equal 20% weighting per day, making the forecast a simple mean.
+- Station X72’s last 5 days are more variable, causing the predicted mean to differ more from individual days.
+- Station X79’s last 5 days are tighter, meaning its forecast almost matches each day.
+
+```{r}
+cat("Predicted next day demand for Station X72 (k=5) =", round(k5_pred_s1,1), "\n")
+cat("Predicted next day demand for Station X79 (k=5) =", round(k5_pred_s2,1), "\n")
+
+par(mfrow=c(1,2))
+barplot(last_window_s1_k5,
+        main="Last 5 Days Demand - X72",
+        names.arg=paste0("Day-",1:5),
+        col="skyblue", ylab="Daily Demand")
+barplot(last_window_s1_k5*(1/5),
+        main="k=5 Contribution - X72",
+        names.arg=paste0("Day-",1:5),
+        col="orange", ylab="Weighted Contribution")
+```
+
+<center>*Fig. 9: Last 5 Days Demand and Contribution to k=5 Forecast for Station X72*</center>
+ 
+ 
+
+**Observations:**
+- The barplots reinforce the idea of equal contribution for each day.
+- The contribution chart shows how higher-demand days push the forecast upward proportionally.
+
+```{r}
+kable(
+  forecast_df,
+  caption = "Table 4. Next 3-Day Forecasts for Stations X72 and X79 with Different k Values"
+)
+
+par(mfrow=c(1,2), mar=c(5,4,5,2))
+barplot(
+  t(as.matrix(forecast_df[,c("Station_X72_k5","Station_X72_k10","Station_X72_k15")])),
+  beside=TRUE,
+  names.arg=paste0("Day+",1:3),
+  col=c("red","green","purple"),
+  main="Forecast Comparison - Station X72",
+  ylab="Predicted Daily Demand",
+  ylim=c(0, max(forecast_df))
+)
+legend("bottom", legend=c("k=5","k=10","k=15"), fill=c("red","green","purple"), horiz=TRUE, inset=c(0,-0.35), xpd=NA, bty="n")
+
+barplot(
+  t(as.matrix(forecast_df[,c("Station_X79_k5","Station_X79_k10","Station_X79_k15")])),
+  beside=TRUE,
+  names.arg=paste0("Day+",1:3),
+  col=c("red","green","purple"),
+  main="Forecast Comparison - Station X79",
+  ylab="Predicted Daily Demand",
+  ylim=c(0, max(forecast_df))
+)
+legend("bottom", legend=c("k=5","k=10","k=15"), fill=c("red","green","purple"), horiz=TRUE, inset=c(0,-0.35), xpd=NA, bty="n")
+```
+
+<center>*Fig. 10: Bar Plots of Daily Demand Forecasts for Stations X72 and X79*</center>
+ 
+ 
+
+> **Forecast Analysis for Daily Demand:**
+> 
+> Looking at the 3-day forecasts, Station X72 consistently predicts higher demand than Station X79, reflecting its heavier usage patterns.
+> 
+> - For Day+1, the most responsive forecast (k=5) suggests 52.8 bikes/day for Station X72, while Station X79 is lower at 40.8 bikes/day.
+> 
+> - As the smoothing window increases, the demand baseline rises for Station X72 (71.8 at k=10, 76.6 at k=15), showing how the longer window incorporates older, higher-demand periods. The same is true for Station X79, where k=15 stabilizes around 61 bikes/day, notably higher than the recent dip reflected in k=5.
+> 
+> The same pattern holds over the next two days. For example, by Day+3:
+> 
+> - Station X72 drops to 39.7 bikes/day for k=5, but remains much higher at 74.9 for k=15, highlighting how the longer horizon resists short-term dips.
+> 
+> - Station X79 similarly drops to 30.8 (k=5) but smooths at ~62 bikes/day for k=15, almost double the recent average, suggesting the longer smoothing window lags behind the true downward trend.
+> 
+> What does this mean operationally?
+> 
+> - k=5 provides a demand signal that reacts to very recent changes, making it better for short-term redistribution and staffing decisions. If the last few days were unusually low or high, k=5 captures that shift immediately.
+> 
+> - k=10 and k=15 serve as rolling baselines, which are more stable for long-term planning, like setting weekly supply levels. However, they risk overpredicting when demand is falling (as seen in Station X79) or underpredicting after a surge.
+> 
+> Comparing stations:
+> 
+> - Station X72 is more volatile—its Day+1 to Day+3 forecasts drop by 25% under k=5, showing it experiences sharper daily swings.
+> 
+> - Station X79 is steadier, with k=5 forecasts only falling about 10 bikes/day over the same horizon, making all k-values closer together.
+> 
+> In practice, combining both short-term (k=5) and long-term (k=15) views gives a balanced picture: managers can see immediate redistribution needs without losing sight of the longer-term demand trend.
+>
+
+## Summary
+> 
+> For this assignment, I analyzed CitiBike demand at two stations using simple moving averages, decomposition, and autocorrelation. After aggregating the hourly data to daily totals, I decomposed each series to highlight daily seasonality and used ACF/PACF plots to confirm stationarity after differencing. I applied moving averages with k values of 5, 10, and 15 to smooth the series and compare how each captured short-term fluctuations versus longer-term trends. While moving averages don’t explicitly model trend or seasonality, they offered a straightforward way to forecast demand based on recent patterns. Overall, the process helped surface meaningful differences between stations and provided a hands-on look at how smoothing techniques behave in practice.
+
+## Appendix: Full Code

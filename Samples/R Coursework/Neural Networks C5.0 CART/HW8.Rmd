@@ -1,0 +1,364 @@
+---
+title: "IE 575 Homework 8"
+author: "Eric Smith"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, include=FALSE}
+  
+# Load necessary libraries
+library(dplyr)
+library(tibble)
+library(nnet)
+library(caret)
+library(pROC)
+library(NeuralNetTools)
+library(ggplot2)
+library(readxl)
+library(tidyr)
+
+# Set working directory
+setwd("D:/GradSchool/IE575/Lesson10")
+
+```
+
+# 1.1 Explore the dataset
+
+```{r}
+
+data <- read_excel("default_of_credit_card_clients.xlsx")
+# Display the first few rows of the dataset
+head(data)
+
+#Display structure
+str(data)
+
+```
+
+
+```{r}
+
+# Step 1: Extract the column names from the first row
+col_names <- as.character(data[1, -1])  # drop the first column ("ID")
+
+# Step 2: Drop the first row and first column, then set names
+data_clean <- data[-1, -1]
+names(data_clean) <- col_names
+
+# Step 3: Convert columns to numeric
+data_clean <- data_clean %>%
+  mutate(across(everything(), as.numeric))
+
+# Step 4: Convert response variable to factor with consistent levels
+data_clean$`default payment next month` <- factor(data_clean$`default payment next month`, levels = c(0, 1))
+
+
+
+```
+
+
+```{r}
+
+# Report NAs per column
+na_report <- data_clean %>%
+  summarise(across(everything(), ~ sum(is.na(.)))) %>%
+  pivot_longer(cols = everything(),
+               names_to = "Column",
+               values_to = "Missing_Values")
+
+# Count duplicates
+duplicate_count <- data_clean %>% duplicated() %>% sum()
+
+# Total number of rows with at least one NA
+rows_with_na <- sum(!complete.cases(data_clean))
+cat("Number of rows with at least one NA:", rows_with_na, "\n")
+
+# Print duplicate info
+cat("Number of duplicate rows:", duplicate_count, "\n")
+
+```
+
+
+```{r}
+
+# Reshape to long format for plotting
+data_long <- data_clean %>%
+  pivot_longer(cols = -`default payment next month`, names_to = "Feature", values_to = "Value")
+
+# Plot small multiples (faceted histograms)
+ggplot(data_long, aes(x = Value)) +
+  geom_histogram(bins = 30, fill = "steelblue", color = "white") +
+  facet_wrap(~ Feature, scales = "free") +
+  theme_minimal() +
+  labs(title = "istogram Distributions of All Features")
+
+```
+
+<center>*Fig 1. Small Multiples: Histogram Distributions of All Features*</center>
+
+> **Dataset Observations**
+> 
+> This dataset has information on 30,000 credit card customers with 23 variables that describe things like age, gender, education, marital status, credit limits, billing amounts, and past payment behavior. The goal is to predict whether someone will default on their payment next month (1 = default, 0 = no default).
+> 
+> When I looked at the data, I saw there were no missing values, but there are 35 duplicate rows that might need to be removed. The first row actually just contains the column names, so that has to be dropped before analysis.
+> 
+> Most customers are in their 20s to 50s as we can see in Fig. 1, and the demographic variables like gender, education, and marriage are mostly straightforward categories. The financial variables, like credit limits and bill amounts, are very skewed—most people have relatively small balances or payments, but a few customers have extremely high values.
+> 
+> The payment history variables show that a lot of people paid on time (coded -1 or 0), but there are also clear cases of late payments. Those delays will probably be strong predictors of default.
+> 
+> So overall, the dataset looks clean and well-structured, but it has a mix of categorical and numeric variables and some very uneven distributions. That means we’ll probably need to scale or normalize the financial data and encode the categories before training a neural network.
+
+
+# 1.2 Create a partioned Neural Network Model
+
+```{r}
+
+# Partition into training and testing sets
+set.seed(123)
+index <- createDataPartition(data_clean$`default payment next month`, p = 0.8, list = FALSE)
+train_data <- data_clean[index, ]
+test_data <- data_clean[-index, ]
+
+
+```
+
+```{r}
+# Normalize predictors (same of preprocess from Lesson)
+normalize <- function(x) { (x - min(x)) / (max(x) - min(x)) }
+
+train_scaled <- train_data %>%
+  mutate(across(-`default payment next month`, normalize))
+
+test_scaled <- test_data %>%
+  mutate(across(-`default payment next month`, normalize))
+
+# Reattach target variable with consistent levels
+train_scaled$`default payment next month` <- factor(train_data$`default payment next month`, levels = c(0, 1))
+test_scaled$`default payment next month` <- factor(test_data$`default payment next month`, levels = c(0, 1))
+
+# Train the neural network
+nn_model <- nnet(
+  `default payment next month` ~ ., 
+  data = train_scaled, 
+  size = 5, 
+  maxit = 500, 
+  decay = 0.01, 
+  trace = FALSE
+)
+
+
+```
+
+```{r}
+# Predict class
+predicted_classes <- predict(nn_model, newdata = test_scaled, type = "class")
+
+# Ensure predicted_classes is a factor with correct levels
+predicted_classes <- factor(predicted_classes, levels = c(0, 1))
+
+# Evaluate with confusion matrix
+conf_matrix <- confusionMatrix(predicted_classes, test_scaled$`default payment next month`)
+print(conf_matrix)
+
+
+```
+
+
+```{r}
+
+# Extract performance metrics from confusion matrix
+performance_metrics <- data.frame(
+  Metric = c("Accuracy", "Sensitivity", "Specificity", "Precision", "F1 Score"),
+  Value = c(
+    round(unname(conf_matrix$overall["Accuracy"]), 3),
+    round(unname(conf_matrix$byClass["Sensitivity"]), 3),
+    round(unname(conf_matrix$byClass["Specificity"]), 3),
+    round(unname(conf_matrix$byClass["Precision"]), 3),
+    round(unname(conf_matrix$byClass["F1"]), 3)
+  ),
+  stringsAsFactors = FALSE
+)
+
+# Display nicely with kable (optional)
+knitr::kable(performance_metrics, caption = "Table 1. Neural Network Model Performance")
+
+```
+
+```{r}
+
+# Load required package
+# install.packages("pROC") # Uncomment if not already installed
+
+
+# --- Predict probabilities from the neural network ---
+# This gives probabilities for the "1" class (default)
+prob_predictions <- predict(nn_model, newdata = test_scaled, type = "raw")
+
+# --- Extract true labels as numeric ---
+true_labels <- as.numeric(as.character(test_scaled$`default payment next month`))
+
+# --- Compute ROC object and plot ---
+roc_obj <- roc(response = true_labels, predictor = prob_predictions)
+
+# Plot ROC curve
+plot(
+  roc_obj,
+  col = "darkblue",
+  lwd = 2,
+  main = "ROC Curve for Neural Network Model",
+  xlab = "1 - Specificity",
+  ylab = "Sensitivity"
+)
+abline(a = 0, b = 1, lty = 2, col = "gray")  # Diagonal reference line
+```
+
+<center>*Fig 2. ROC curve*</center>
+
+```{r}
+
+# --- Print AUC ---
+auc_value <- auc(roc_obj)
+print(paste("AUC:", round(auc_value, 3)))
+
+```
+
+> **Neural Network Observations**
+> 
+> The neural network ended up with about 81% accuracy. The AUC is 0.74, showing it is picking up some patterns in the data reasonably well.
+> 
+> Looking closer, the model is really good at spotting people who won’t default (sensitivity is high at 97%), but it’s not great at catching actual defaulters—the specificity is only 25%. The precision is about 82%, meaning that most of the time when it says someone won’t default, it’s correct.
+> 
+> The F1 score is 0.89, which is a way of combining precision and recall into one number. It tells us the model does a decent job of balancing being correct with not missing too many cases, at least for the majority class.
+> 
+> Overall, the model works reasonably well, but it definitely favors the “no default” outcome, which means it’s not very good at actually finding the people who are at risk.
+
+# 2.1 Identify the variable importance
+
+```{r}
+
+# --- 1. Garson Variable Importance ---
+
+# Extract Garson importance values
+importance_vals <- garson(nn_model, bar_plot = FALSE)
+importance_vec <- unlist(importance_vals)
+
+# Extract actual variable names used in the model
+actual_vars <- attr(nn_model$terms, "term.labels")
+
+# Sanity check to ensure alignment
+if (length(actual_vars) == length(importance_vec)) {
+  importance_df <- data.frame(
+    Variable = actual_vars,
+    GarsonImportance = round(importance_vec, 3)
+  )
+} else {
+  warning("Variable name count mismatch in Garson output.")
+  importance_df <- data.frame(
+    Variable = names(importance_vec),
+    GarsonImportance = round(importance_vec, 3)
+  )
+}
+
+# --- 2. Correlation with Target ---
+
+# Ensure the target is numeric
+cor_vals <- cor(
+  data_clean %>% select(-`default payment next month`),
+  as.numeric(as.character(data_clean$`default payment next month`))
+)
+
+cor_df <- data.frame(
+  Variable = rownames(cor_vals),
+  Correlation = round(cor_vals[, 1], 3)
+)
+
+# --- 3. Merge and Display ---
+
+# Merge by variable name
+var_compare_df <- full_join(importance_df, cor_df, by = "Variable") %>%
+  arrange(desc(GarsonImportance))
+
+# Display
+knitr::kable(var_compare_df, caption = "Table 2. Variable Importance: Garson Method and Correlation with Default")
+
+
+```
+
+```{r}
+
+
+
+# Garson Importance Plot
+ggplot(var_compare_df, aes(x = reorder(Variable, GarsonImportance), y = GarsonImportance)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  coord_flip() +
+  labs(
+    title = "Variable Importance by Garson Method",
+    x = "Variable",
+    y = "Garson Importance"
+  ) +
+  theme_minimal()
+
+```
+
+<center>*Fig 3. Variable Importance using Garson Method*</center>
+
+``` {r}
+
+# Correlation Plot
+ggplot(var_compare_df, aes(x = reorder(Variable, abs(Correlation)), y = Correlation)) +
+  geom_bar(stat = "identity", fill = "darkorange") +
+  coord_flip() +
+  labs(
+    title = "Correlation of Variables with Default Outcome",
+    x = "Variable",
+    y = "Correlation"
+  ) +
+  theme_minimal()
+
+```
+
+<center>*Fig 4. Correlation of Variables from model outcome*</center>
+
+> **Variable Importance Observations**
+> 
+> We looked at which variables were most important using two approaches. Garson’s method comes from the neural network itself—it looks at how much each input contributed to the predictions based on the weights in the model. Correlation is much simpler and just measures how directly each variable relates to the default outcome on its own.
+> 
+> Both methods tell the same basic story. PAY_0, the most recent payment status, is by far the most important factor. Other payment history variables like PAY_2, PAY_3, and PAY_4 also rank high, which makes sense since late payments directly relate to default risk. Some recent payment amounts and bill amounts have moderate importance, but they’re not as strong as the payment history.
+> 
+> On the other end, demographic variables like age, marriage, education, and gender barely matter. Who the person is doesn’t seem to influence default nearly as much as their actual payment behavior.
+> 
+> So overall, the model is driven mainly by recent repayment history, with financial amounts playing a smaller role and demographics having almost no impact.
+
+# 3.1 Insights and credit card company marketing strategy
+
+> From the modeling, a few clear insights stand out. Before training, I scaled all the predictor variables to a 0–1 range so everything was on the same scale. This keeps big numbers like credit limits from overshadowing smaller ones like age and makes it easier for the neural network to learn. The neural network performs reasonably well, with about 81% accuracy and an AUC of 0.74, so it’s definitely picking up useful patterns. It’s very good at identifying customers who won’t default, but it struggles more to catch the ones who actually will. Looking at what drives the predictions, the most important factor is recent payment history—especially PAY_0, the most recent payment status. Other recent repayment statuses and some payment amounts also matter, but demographic information like age, education, or gender has almost no real influence on whether someone defaults.
+> 
+> If I were the credit card company marketing manager, I’d focus on behavioral signals rather than demographics. Instead of targeting customers broadly based on who they are, I’d use their recent repayment behavior to guide our strategy. For example, customers showing early signs of delayed payments could be offered reminders, flexible payment plans, or small incentives to stay on track before they fall too far behind. On the flip side, customers who consistently pay on time could be rewarded with loyalty perks or credit limit increases to strengthen retention.
+> 
+> The main takeaway is that what people do with their accounts now matters far more than who they are, so marketing efforts should prioritize timely engagement with customers who are trending toward risk. Early intervention could reduce defaults, while well-timed rewards could keep reliable customers engaged and loyal.
+> 
+> Key observations:
+> 
+> - Default risk is driven mainly by recent repayment history, especially the most recent month (PAY_0).
+> 
+> - Other repayment history variables (PAY_2, PAY_3, etc.) also matter, while demographics like age, gender, and education have very little influence.
+> 
+> - The model is better at identifying safe customers than catching those who will default.
+> 
+> Action items based on the model:
+> 
+> - Segment customers by recent repayment history, since this is the strongest predictor of default.
+> 
+> - Prioritize monitoring the most recent payment behavior (PAY_0) to flag potential risk earlier.
+> 
+> - Use repayment history patterns (e.g., consistent late payments) to guide which customers should receive closer follow-up or tailored communication.
+> 
+> - Avoid relying on demographic information for targeting, since it adds little value in predicting default.
+
+# Appendix

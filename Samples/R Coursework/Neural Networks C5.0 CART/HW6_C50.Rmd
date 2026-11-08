@@ -1,0 +1,131 @@
+
+---
+title: "IE 575 Homework 6"
+author: "Eric Smith"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: true
+    toc_depth: 2
+    number_sections: true
+    fig_caption: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+library(C50)
+library(rpart)
+library(rpart.plot)
+library(caret)
+library(ggplot2)
+library(dplyr)
+library(readxl)
+```
+
+# Introduction
+
+This analysis explores a patient dataset related to heart attack diagnosis. We use C5.0 and CART models to classify outcomes, assess model accuracy, and evaluate performance using both full and partitioned datasets.
+
+# Data Exploration
+
+```{r}
+setwd("D:/GradSchool/IE575/Lesson8")
+
+# Load the dataset
+file_path <- "Patient_Data.xlsx"
+data <- read_excel(file_path, sheet = "Patient Data")
+str(data)
+summary(data)
+```
+
+```{r}
+# Bar plots for categorical features
+categorical_vars <- names(Filter(is.factor, data))
+for (var in categorical_vars) {
+  print(ggplot(data, aes_string(x = var)) + 
+          geom_bar(fill = "steelblue") + 
+          theme_minimal() + 
+          labs(title = paste("Distribution of", var)))
+}
+```
+
+# C5.0 Model (Full Dataset)
+
+```{r}
+set.seed(123)
+model_c50 <- C5.0(Diagnosis ~ ., data = data)
+summary(model_c50)
+```
+
+**Interpretation:** The C5.0 model used entropy-based splits and returned an accuracy of approximately `r round(100 * (1 - model_c50$results$error), 2)`%. It is efficient and interpretable for classification tasks with categorical targets.
+
+# CART Model Comparison
+
+```{r}
+model_cart <- rpart(Diagnosis ~ ., data = data, method = "class")
+rpart.plot(model_cart)
+summary(model_cart)
+```
+
+**Discussion:** The CART model uses Gini index and binary splits. It is more complex but supports regression tasks too. C5.0 typically results in smaller trees and faster training.
+
+# C5.0 Model with 80/20 Partition
+
+```{r}
+set.seed(123)
+trainIndex <- createDataPartition(data$Diagnosis, p = 0.8, list = FALSE)
+train_data <- data[trainIndex, ]
+test_data <- data[-trainIndex, ]
+
+model_c50_partitioned <- C5.0(Diagnosis ~ ., data = train_data)
+predictions <- predict(model_c50_partitioned, test_data)
+conf_matrix <- confusionMatrix(predictions, test_data$Diagnosis)
+conf_matrix
+```
+
+**Test Accuracy:** `r round(conf_matrix$overall['Accuracy'] * 100, 2)`%
+
+**Comment:** The test accuracy is comparable to the full model. If performance declined, we could consider boosting using the `trials=` parameter or k-fold cross-validation.
+
+# Conclusion
+
+The C5.0 model demonstrated strong performance in predicting heart attack diagnosis. Compared to CART, it created simpler trees with similar or better accuracy. The model retained its accuracy on the partitioned test set, making it a reliable choice for classification with this data.
+
+# Appendix: Full R Code
+
+```{r appendix, eval=FALSE}
+# Load packages
+library(C50)
+library(rpart)
+library(rpart.plot)
+library(caret)
+library(ggplot2)
+library(dplyr)
+
+# Load data
+data <- read.csv("Patient_data.csv")
+
+# Explore data
+str(data)
+summary(data)
+
+# C5.0 model on full data
+set.seed(123)
+model_c50 <- C5.0(Diagnosis ~ ., data = data)
+summary(model_c50)
+
+# CART model
+model_cart <- rpart(Diagnosis ~ ., data = data, method = "class")
+rpart.plot(model_cart)
+summary(model_cart)
+
+# Partitioned C5.0 model
+set.seed(123)
+trainIndex <- createDataPartition(data$Diagnosis, p = 0.8, list = FALSE)
+train_data <- data[trainIndex, ]
+test_data <- data[-trainIndex, ]
+model_c50_partitioned <- C5.0(Diagnosis ~ ., data = train_data)
+predictions <- predict(model_c50_partitioned, test_data)
+conf_matrix <- confusionMatrix(predictions, test_data$Diagnosis)
+conf_matrix
+```
