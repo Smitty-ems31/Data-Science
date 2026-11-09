@@ -1,10 +1,4 @@
 # -*- coding: utf-8 -*-
-"""
-Created on Tue Jun 12 16:37:25 2018
-
-@author: Leo
-"""
-
 
  	
 
